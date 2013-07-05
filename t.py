@@ -74,15 +74,11 @@ def _task_from_taskline(taskline):
 
 def _tasklines_from_tasks(tasks):
     """Parse a list of tasks into tasklines suitable for writing."""
-
-    tasklines = []
-
-    for task in tasks:
-        meta = [m for m in task.items() if m[0] != 'text']
-        meta_str = ', '.join('%s:%s' % m for m in meta)
-        tasklines.append('%s | %s\n' % (task['text'], meta_str))
-
-    return tasklines
+    for key in tasks._sequence:
+        task = tasks[key]
+        meta_str = ', '.join('%s:%s' % (k, v) for k, v in task.iteritems()
+                             if k != 'text')
+        yield '%s | %s' (task['text'], meta_str)
 
 
 def _prefixes(ids):
@@ -124,87 +120,76 @@ def _prefixes(ids):
     return ps
 
 
-class TaskDict(object):
+class TaskContainer(object):
     """A set of tasks, both finished and unfinished, for a given list.
 
-    The list's files are read from disk when the TaskDict is initialized. They
+    The list's files are read from disk when the TaskContainer is initialized. They
     can be written back out to disk with the write() function.
 
     """
-    def __init__(self, taskdir='.', name='tasks'):
+    def __init__(self, dirpath='.', filename='tasks.txt'):
         """Initialize by reading the task files, if they exist."""
-        self.tasks = {}
-        self.done = {}
-        self.name = name
-        self.taskdir = taskdir
-        filemap = (('tasks', self.name), ('done', '.%s.done' % self.name))
-        for kind, filename in filemap:
-            path = os.path.join(os.path.expanduser(self.taskdir), filename)
-            if os.path.isdir(path):
-                raise InvalidTaskfile
-            if os.path.exists(path):
-                with open(path, 'r') as tfile:
-                    tls = [tl.strip() for tl in tfile if tl]
-                    tasks = map(_task_from_taskline, tls)
-                    for task in tasks:
-                        if task is not None:
-                            getattr(self, kind)[task['id']] = task
+        self.filepath = os.path.join(os.path.expanduser(dirpath), filename)
+        self.done_filepath = os.path.join(os.path.expanduser(dirpath), '.done.%s' % filename)
 
-    def __getitem__(self, prefix):
-        """Return the unfinished task with the given prefix.
+        self.tasks = self._parse_file(self.filepath)
+        self.done = self._parse_file(self.done_filepath)
 
-        If more than one task matches the prefix an AmbiguousPrefix exception
-        will be raised, unless the prefix is the entire ID of one task.
+    def _parse_file(self, filepath):
+        if os.path.isdir(filepath) or not os.path.exists(filepath):
+            raise InvalidTaskfile(filepath)
 
-        If no tasks match the prefix an UnknownPrefix exception will be raised.
+        tasks = []
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                task = _task_from_taskline(line)
+                if task is not None:
+                    tasks.append(task)
+        return tasks
 
-        """
-        matched = filter(lambda tid: tid.startswith(prefix), self.tasks.keys())
-        if len(matched) == 1:
-            return self.tasks[matched[0]]
-        elif len(matched) == 0:
-            raise UnknownPrefix(prefix)
-        else:
-            matched = filter(lambda tid: tid == prefix, self.tasks.keys())
-            if len(matched) == 1:
-                return self.tasks[matched[0]]
-            else:
-                raise AmbiguousPrefix(prefix)
+    def append(self, t):
+        self.tasks.append(t)
 
-    def add_task(self, text):
+    def add(self, text):
         """Add a new, unfinished task with the given summary text."""
-        task_id = _hash(text)
-        self.tasks[task_id] = {'id': task_id, 'text': text}
+        self.tasks.insert(0, {
+            'id': _hash(text),
+            'text': text
+        })
 
-    def edit_task(self, prefix, text):
+    def edit(self, prefix, text):
         """Edit the task with the given prefix.
 
         If more than one task matches the prefix an AmbiguousPrefix exception
         will be raised, unless the prefix is the entire ID of one task.
 
         If no tasks match the prefix an UnknownPrefix exception will be raised.
-
         """
-        task = self[prefix]
+        task = self.get_by_prefix(prefix)
         if text.startswith('s/') or text.startswith('/'):
             text = re.sub('^s?/', '', text).rstrip('/')
             find, _, repl = text.partition('/')
             text = re.sub(find, repl, task['text'])
-
         task['text'] = text
 
-    def finish_task(self, prefix):
+        self.tasks.remove(task)
+        self.tasks.insert(0, task)
+
+    def finish(self, prefix):
         """Mark the task with the given prefix as finished.
 
         If more than one task matches the prefix an AmbiguousPrefix exception
         will be raised, if no tasks match it an UnknownPrefix exception will
         be raised.
-
         """
-        task = self.tasks.pop(self[prefix]['id'])
-        self.done[task['id']] = task
+        task = self.get_by_prefix(prefix)
+        self.tasks.remove(task)
+        self.done.insert(0, task)
 
-    def remove_task(self, prefix):
+    def remove(self, prefix):
         """Remove the task from tasks list.
 
         If more than one task matches the prefix an AmbiguousPrefix exception
@@ -212,37 +197,57 @@ class TaskDict(object):
         be raised.
 
         """
-        self.tasks.pop(self[prefix]['id'])
+        self.tasks.remove(self.get_by_prefix(prefix))
 
-    def print_list(self, kind='tasks', verbose=False, quiet=False, grep=''):
+    def print_list(self, kind='undone', verbose=False, grep=''):
         """Print out a nicely formatted list of unfinished tasks."""
-        tasks = dict(getattr(self, kind).items())
-        label = 'prefix' if not verbose else 'id'
+        #tasks = dict(getattr(self, kind).items())
+        #label = 'prefix' if not verbose else 'id'
 
-        if not verbose:
-            for task_id, prefix in _prefixes(tasks).items():
-                tasks[task_id]['prefix'] = prefix
+        prefixes = _prefixes(self.tasks)
 
-        plen = max(map(lambda t: len(t[label]), tasks.values())) if tasks else 0
-        for _, task in sorted(tasks.items()):
+        #if not verbose:
+            #for task_id, prefix in _prefixes(tasks).items():
+                #tasks[task_id]['prefix'] = prefix
+
+        plen = max(map(lambda t: len(prefixes[t['id']]), self.tasks)) if self.tasks else 0
+        for _, task in self.tasks:
             if grep.lower() in task['text'].lower():
-                p = '%s - ' % task[label].ljust(plen) if not quiet else ''
-                print p + task['text']
+                s = '%s - %s' % (prefixes[task['id']].ljust(plen), task['text'])
+                print s
+
+    def _write_to_file(self, tasks, filepath):
+        with open(filepath, 'w') as f:
+            for line in _tasklines_from_tasks(tasks):
+                f.write(line)
 
     def write(self, delete_if_empty=False):
         """Flush the finished and unfinished tasks to the files on disk."""
-        filemap = (('tasks', self.name), ('done', '.%s.done' % self.name))
-        for kind, filename in filemap:
-            path = os.path.join(os.path.expanduser(self.taskdir), filename)
-            if os.path.isdir(path):
-                raise InvalidTaskfile
-            tasks = sorted(getattr(self, kind).values(), key=itemgetter('id'))
-            if tasks or not delete_if_empty:
-                with open(path, 'w') as tfile:
-                    for taskline in _tasklines_from_tasks(tasks):
-                        tfile.write(taskline)
-            elif not tasks and os.path.isfile(path):
-                os.remove(path)
+        if self.tasks or not delete_if_empty:
+            self._write_to_file(self.tasks, self.filepath)
+        elif not self.tasks:
+            os.remove(self.filepath)
+
+        self._write_to_file(self.done, self.done_filepath)
+
+    def get(self, id):
+        for t in self.tasks:
+            if t['id'] == id:
+                return t
+        return None
+
+    def get_by_prefix(self, prefix):
+        matched = filter(lambda t: t['id'].startswith(prefix), self.tasks)
+        if len(matched) == 1:
+            return matched[0]
+        elif len(matched) == 0:
+            raise UnknownPrefix(prefix)
+        else:
+            matched = filter(lambda t: t['id'] == prefix, self.tasks)
+            if len(matched) == 1:
+                return matched[0]
+            else:
+                raise AmbiguousPrefix(prefix)
 
 
 def _build_parser():
@@ -291,25 +296,25 @@ def _main():
     """Run the command-line interface."""
     (options, args) = _build_parser().parse_args()
 
-    td = TaskDict(taskdir=options.taskdir, name=options.name)
+    tc = TaskContainer(taskdir=options.taskdir, name=options.name)
     text = ' '.join(args).strip()
 
     try:
         if options.finish:
-            td.finish_task(options.finish)
-            td.write(options.delete)
+            tc.finish(options.finish)
+            tc.write(options.delete)
         elif options.remove:
-            td.remove_task(options.remove)
-            td.write(options.delete)
+            tc.remove(options.remove)
+            tc.write(options.delete)
         elif options.edit:
-            td.edit_task(options.edit, text)
-            td.write(options.delete)
+            tc.edit(options.edit, text)
+            tc.write(options.delete)
         elif text:
-            td.add_task(text)
-            td.write(options.delete)
+            tc.add(text)
+            tc.write(options.delete)
         else:
-            kind = 'tasks' if not options.done else 'done'
-            td.print_list(kind=kind, verbose=options.verbose, quiet=options.quiet,
+            kind = 'undone' if not options.done else 'done'
+            tc.print_list(kind=kind, verbose=options.verbose, quiet=options.quiet,
                           grep=options.grep)
     except AmbiguousPrefix, e:
         sys.stderr.write('The ID "%s" matches more than one task.\n' % e.prefix)
